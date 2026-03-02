@@ -7,7 +7,7 @@ import multer from 'multer';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdf = require('pdf-parse');
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { ChatOpenAI } from "@langchain/openai";
 import { StateGraph, MessagesAnnotation } from "@langchain/langgraph";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
@@ -63,9 +63,12 @@ app.get("/journals", async (req, res) => {
 });
 
 // 5. LangGraph Logic
-const model = new ChatGoogleGenerativeAI({
-  model: "gemini-2.5-flash-lite",
-  apiKey: process.env.GOOGLE_API_KEY,
+const model = new ChatOpenAI({
+  model: "meta-llama/llama-3.1-8b-instruct",
+  apiKey: process.env.OPENROUTER_API_KEY,
+  configuration: {
+    baseURL: "https://openrouter.ai/api/v1",
+  },
 });
 
 // Store conversation history per thread (only user and AI messages, no system)
