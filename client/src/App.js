@@ -9,6 +9,7 @@ function App() {
   const [input, setInput] = useState("");
   const [chatSessions, setChatSessions] = useState({}); // Track chat session IDs per journal
   const [selectedJournal, setSelectedJournal] = useState(null); // Selected journal for chat
+  const [correctionMode, setCorrectionMode] = useState(null); // {messageIndex, originalText}
 
   // Create a unique session ID for LangGraph memory
   const [sessionId] = useState("session-" + Math.random().toString(36).substr(2, 9));
@@ -99,6 +100,43 @@ function App() {
     }
   };
 
+  const handleCorrectAnswer = async (messageIndex, originalText) => {
+    const correctAnswer = prompt("Please provide the correct answer:", originalText);
+    if (correctAnswer && correctAnswer.trim() !== "" && correctAnswer.trim() !== originalText) {
+      try {
+        const chatSessionId = chatSessions[selectedJournal] || Date.now().toString();
+        const threadId = `${sessionId}-${selectedJournal}-${chatSessionId}`;
+
+        await fetch("http://localhost:3001/correct-answer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            journalId: selectedJournal,
+            threadId: threadId,
+            incorrectAnswer: originalText,
+            correctAnswer: correctAnswer.trim()
+          })
+        });
+
+        // Update the message with the corrected answer
+        const currentMsgs = messages[selectedJournal] || [];
+        const updatedMsgs = currentMsgs.map((msg, idx) => 
+          idx === messageIndex ? { ...msg, text: correctAnswer.trim(), corrected: true } : msg
+        );
+        
+        setMessages({
+          ...messages,
+          [selectedJournal]: updatedMsgs
+        });
+
+        alert("Corrected answer saved to memory!");
+      } catch (err) {
+        console.error("Error saving corrected answer:", err);
+        alert("Failed to save corrected answer. Please try again.");
+      }
+    }
+  };
+
 
 
   return (
@@ -138,13 +176,55 @@ function App() {
       <div style={{ border: "1px solid #ddd", height: "400px", overflowY: "scroll", padding: "10px" }}>
         {getCurrentMessages().map((msg, idx) => (
           <div key={idx} style={{ textAlign: msg.role === "user" ? "right" : "left", margin: "10px" }}>
-            <span style={{
-              background: msg.role === "user" ? "#007bff" : "#f1f1f1",
-              color: msg.role === "user" ? "white" : "black",
-              padding: "8px", borderRadius: "5px"
-            }}>
-              {msg.text}
-            </span>
+            <div style={{ position: "relative" }}>
+              <span style={{
+                background: msg.role === "user" ? "#007bff" : (msg.corrected ? "#28a745" : "#f1f1f1"),
+                color: msg.role === "user" ? "white" : (msg.corrected ? "white" : "black"),
+                padding: "8px",
+                borderRadius: "5px",
+                display: "inline-block"
+              }}>
+                {msg.text}
+              </span>
+              {msg.role === "bot" && !msg.corrected && (
+                <button
+                  onClick={() => handleCorrectAnswer(idx, msg.text)}
+                  style={{
+                    position: "absolute",
+                    top: "-10px",
+                    right: "-10px",
+                    fontSize: "12px",
+                    padding: "4px 8px",
+                    backgroundColor: "#dc3545",
+                    color: "white",
+                    border: "none",
+                    borderRadius: "15px",
+                    cursor: "pointer",
+                    boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                    zIndex: 10
+                  }}
+                  title="Correct this answer"
+                >
+                  ✏️ Correct
+                </button>
+              )}
+              {msg.corrected && (
+                <span style={{
+                  position: "absolute",
+                  top: "-10px",
+                  right: "-10px",
+                  fontSize: "12px",
+                  color: "#28a745",
+                  fontWeight: "bold",
+                  backgroundColor: "white",
+                  padding: "2px 6px",
+                  borderRadius: "10px",
+                  boxShadow: "0 1px 3px rgba(0,0,0,0.1)"
+                }}>
+                  ✓ Corrected
+                </span>
+              )}
+            </div>
           </div>
         ))}
       </div>
