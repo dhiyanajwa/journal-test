@@ -8,11 +8,13 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdf = require('pdf-parse');
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { StateGraph, MessagesAnnotation } from "@langchain/langgraph";
+import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/huggingface_transformers";
+import { StateGraph, MessagesAnnotation, Annotation } from "@langchain/langgraph";
 import { HumanMessage, SystemMessage, AIMessage } from "@langchain/core/messages";
 import { HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
+console.log("🚀 !!! [SESSION B] SERVER RUNNING VERSION: LOCAL HUGGING FACE EMBEDDINGS (FREE) !!! 🚀");
 console.log("🔍 Checking API Keys...");
 if (process.env.CEREBRAS_API_KEY) {
   console.log("✅ CEREBRAS_API_KEY found:", process.env.CEREBRAS_API_KEY.substring(0, 10) + "...");
@@ -77,6 +79,7 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
     const buffer = req.file.buffer;
     const data = await pdf(buffer);
     const text = data.text;
+    console.log(`📄 PDF parsed. Length: ${text.length} characters.`);
 
     const connection = await mysql.createConnection(dbConfig);
 
@@ -93,23 +96,38 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
       chunkOverlap: 500, // Increased from 300 for better continuity
     });
     const chunks = await splitter.createDocuments([text]);
+    console.log(`✂️ Split into ${chunks.length} chunks.`);
 
-    sendProgress({ status: "indexing", message: `Storing ${chunks.length} chunks without embeddings...`, total: chunks.length });
+    const embeddings = new HuggingFaceTransformersEmbeddings({
+      modelName: "Xenova/all-MiniLM-L6-v2",
+    });
+
+    sendProgress({ status: "embedding", message: `Generating and storing embeddings for ${chunks.length} chunks...`, total: chunks.length });
+    console.log(`🧠 Generating local embeddings for ${chunks.length} chunks...`);
 
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i].pageContent;
-      
+
+      let vectorJson = null;
+      try {
+        const vector = await embeddings.embedQuery(chunkText);
+        vectorJson = JSON.stringify(vector);
+      } catch (embErr) {
+        console.error("Embedding generation failed for chunk", i, embErr);
+      }
+
       await connection.execute(
-        "INSERT INTO journal_chunks (journal_id, content) VALUES (?, ?)",
-        [journalId, chunkText]
+        "INSERT INTO journal_chunks (journal_id, content, embedding) VALUES (?, ?, ?)",
+        [journalId, chunkText, vectorJson]
       );
 
       if (i % 10 === 0 || i === chunks.length - 1) {
-        sendProgress({ status: "indexing", message: `Indexing... ${i + 1}/${chunks.length}`, current: i + 1, total: chunks.length });
+        sendProgress({ status: "embedding", message: `Embedding & Indexing... ${i + 1}/${chunks.length}`, current: i + 1, total: chunks.length });
       }
     }
 
     await connection.end();
+    console.log("✅ PDF indexing complete and stored in MySQL.");
     sendProgress({ status: "complete", message: "Journal indexed and ready for chat!", journalId });
     res.end();
 
@@ -190,9 +208,9 @@ fetch("https://api.cerebras.ai/v1/chat/completions", {
     messages: [{ role: "user", content: "Say the word 'Testing'" }]
   })
 })
-.then(res => res.text())
-.then(text => console.log("\n🚀 RAW CEREBRAS RESPONSE:\n", text))
-.catch(err => console.error("\n❌ RAW CEREBRAS ERROR:\n", err));
+  .then(res => res.text())
+  .then(text => console.log("\n🚀 RAW CEREBRAS RESPONSE:\n", text))
+  .catch(err => console.error("\n❌ RAW CEREBRAS ERROR:\n", err));
 
 import { ChatOpenAI } from "@langchain/openai";
 
@@ -233,10 +251,18 @@ const initDB = async () => {
         id INT AUTO_INCREMENT PRIMARY KEY,
         journal_id INT,
         content TEXT,
+        embedding JSON,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX (journal_id)
       )
     `);
+
+    try {
+      await connection.execute(`ALTER TABLE journal_chunks ADD COLUMN embedding JSON`);
+      console.log("✅ Added embedding column to journal_chunks");
+    } catch (e) {
+      // Ignore if column already exists
+    }
 
     console.log("✅ MySQL RAG & Persistence Tables Ready");
   } catch (err) {
@@ -245,13 +271,157 @@ const initDB = async () => {
 };
 initDB();
 
-const graphBuilder = new StateGraph(MessagesAnnotation)
-  .addNode("agent", async (state) => {
-    const response = await model.invoke(state.messages);
-    return { messages: [response] };
+// Cosine similarity helper
+function cosineSimilarity(vecA, vecB) {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  return normA === 0 || normB === 0 ? 0 : dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+const GraphState = Annotation.Root({
+  messages: Annotation({
+    reducer: (x, y) => x.concat(y),
+    default: () => [],
+  }),
+  context: Annotation({
+    reducer: (x, y) => y ?? x,
+    default: () => "",
+  }),
+  journalId: Annotation({
+    reducer: (x, y) => y ?? x,
+    default: () => null,
+  }),
+  journalFilename: Annotation({
+    reducer: (x, y) => y ?? x,
+    default: () => "",
+  }),
+  history: Annotation({
+    reducer: (x, y) => y ?? x,
+    default: () => [],
+  }),
+  correctedAnswers: Annotation({
+    reducer: (x, y) => y ?? x,
+    default: () => [],
+  }),
+  sendStatus: Annotation({
+    reducer: (x, y) => y ?? x,
+    default: () => () => { },
   })
-  .addEdge("__start__", "agent")
-  .addEdge("agent", "__end__");
+});
+
+const retrieveNode = async (state) => {
+  state.sendStatus("Embedding user question...");
+  const lastMessage = state.messages[state.messages.length - 1].content;
+
+  const embeddings = new HuggingFaceTransformersEmbeddings({
+    modelName: "Xenova/all-MiniLM-L6-v2",
+  });
+
+  let questionVector = [];
+  try {
+    questionVector = await embeddings.embedQuery(lastMessage);
+  } catch (err) {
+    console.error("Failed to embed question:", err);
+    return { context: "Error: Could not embed question for search." };
+  }
+
+  state.sendStatus("Searching database for relevant context...");
+  const [chunkRows] = await pool.execute("SELECT content, embedding FROM journal_chunks WHERE journal_id = ?", [state.journalId]);
+
+  let relevantContext = "";
+
+  if (chunkRows.length > 0) {
+    state.sendStatus(`Ranking ${chunkRows.length} chunks by semantic similarity...`);
+
+    // Calculate similarities
+    const scoredChunks = chunkRows.map(row => {
+      let score = 0;
+      if (row.embedding) {
+        try {
+          const chunkVector = typeof row.embedding === 'string' ? JSON.parse(row.embedding) : row.embedding;
+          if (Array.isArray(chunkVector) && chunkVector.length === questionVector.length) {
+            score = cosineSimilarity(questionVector, chunkVector);
+          }
+        } catch (e) {
+          console.error("Failed to parse embedding", e);
+        }
+      }
+      return { content: row.content, score: score };
+    });
+
+    const topChunks = scoredChunks
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8); // Reduced from 15 to 8 to avoid 400 error while keeping context high
+
+    // Fallback: If top score is low, try a keyword search
+    if (topChunks.length > 0 && topChunks[0].score < 0.3) {
+      console.log("⚠️ Semantic score low, adding keyword results...");
+      const keywords = lastMessage.split(' ').filter(w => w.length > 3);
+      if (keywords.length > 0) {
+        const likeQuery = keywords.map(() => "content LIKE ?").join(" OR ");
+        const [kwRows] = await pool.execute(`SELECT content FROM journal_chunks WHERE journal_id = ? AND (${likeQuery}) LIMIT 5`, [state.journalId, ...keywords.map(k => `%${k}%`)]);
+        kwRows.forEach(row => {
+          if (!topChunks.find(c => c.content === row.content)) {
+            topChunks.push({ content: row.content, score: 0.1 });
+          }
+        });
+      }
+    }
+
+    relevantContext = topChunks.map(c => c.content).join("\n\n---\n\n");
+    console.log(`🧠 Semantic search: Retrieved ${topChunks.length} chunks (Top score: ${topChunks[0]?.score?.toFixed(3) || 'N/A'})`);
+  } else {
+    state.sendStatus("No chunks found with embeddings, using full text fallback...");
+    const [fullRows] = await pool.execute("SELECT content FROM journals WHERE id = ?", [state.journalId]);
+    relevantContext = fullRows[0] ? fullRows[0].content.substring(0, 8000) : "";
+  }
+
+  return { context: relevantContext };
+};
+
+const generateNode = async (state) => {
+  state.sendStatus("Generating response with Cerebras Llama 3.3...");
+  const lastMessage = state.messages[state.messages.length - 1].content;
+
+  let systemPrompt = `You are a strict and helpful assistant discussing the document: "${state.journalFilename}".
+
+  CRITICAL RULES:
+  1. You MUST use the specific information provided in the "RELEVANT CONTEXT" below to answer the user's question accurately.
+  2. If the user's question asks for specific technical facts (numbers, precise names) that are NOT explicitly written in the provided context, you should reply verbatim: "Based on the available context from the document, I cannot find a specific answer to this question."
+  3. However, if the answer can be reasonably inferred or summarized from the provided snippets, please do so.
+  4. DO NOT invent, guess, or hallucinate quotes or facts.
+  5. The user might ask a follow-up question. Use the conversation history provided to understand the context of their new question.`;
+
+  if (state.correctedAnswers && state.correctedAnswers.length > 0) {
+    systemPrompt += `\n\nIMPORTANT: The following corrections have been made in previous conversations and should be used as authoritative information over-riding the context:
+    ${state.correctedAnswers.map((answer, index) => `${index + 1}. ${answer}`).join('\n')}`;
+  }
+
+  systemPrompt += `
+  
+  --- RELEVANT CONTEXT START ---
+  ${state.context}
+  --- RELEVANT CONTEXT END ---`;
+
+  const contextualMessage = `${systemPrompt}\n\nUser Question: ${lastMessage}`;
+  const allMessages = [...state.history, new HumanMessage(contextualMessage)];
+
+  const response = await model.invoke(allMessages);
+  return { messages: [response] };
+};
+
+const graphBuilder = new StateGraph(GraphState)
+  .addNode("retrieve", retrieveNode)
+  .addNode("generate", generateNode)
+  .addEdge("__start__", "retrieve")
+  .addEdge("retrieve", "generate")
+  .addEdge("generate", "__end__");
 
 const appGraph = graphBuilder.compile();
 
@@ -286,102 +456,32 @@ app.post("/chat", async (req, res) => {
 
     const journalFilename = journalRows[0].filename;
 
-    // 1. Query Expansion and 2. DB Fetching (HISTORY & CHUNKS) in Parallel
-    sendStatus("Preparing context and history...");
+    // Fetch History
+    sendStatus("Fetching conversation history...");
+    const [historyRows] = await pool.execute("SELECT role, content FROM conversation_history WHERE thread_id = ? ORDER BY created_at ASC LIMIT 10", [threadId]);
 
-    let historyRows = [];
-    let chunkRows = [];
-
-    try {
-      // Fetch data without query expansion for better performance
-      const [[hRows], [cRows]] = await Promise.all([
-        pool.execute("SELECT role, content FROM conversation_history WHERE thread_id = ? ORDER BY created_at ASC LIMIT 10", [threadId]),
-        pool.execute("SELECT content FROM journal_chunks WHERE journal_id = ?", [journalId])
-      ]);
-
-      historyRows = hRows;
-      chunkRows = cRows;
-      console.log("Original Query:", message);
-    } catch (error) {
-      console.error("Database fetch failed:", error.message);
-      // Fallback: try fetching data individually
-      const [hRows] = await pool.execute("SELECT role, content FROM conversation_history WHERE thread_id = ? ORDER BY created_at ASC LIMIT 10", [threadId]);
-      const [cRows] = await pool.execute("SELECT content FROM journal_chunks WHERE journal_id = ?", [journalId]);
-      historyRows = hRows;
-      chunkRows = cRows;
-    }
-
-    // Check for corrected answers in history
     const correctedAnswers = historyRows
       .filter(row => row.role === 'system' && row.content.startsWith('CORRECTED:'))
-      .map(row => row.content.substring(10)); // Remove "CORRECTED: " prefix
-
-    // 3. RAG: Search for relevant chunks using keyword matching only
-    sendStatus("Searching for relevant chunks using keyword matching...");
-    
-    let relevantContext = "";
-    
-    if (chunkRows.length > 0) {
-      sendStatus(`Ranking ${chunkRows.length} chunks by keyword relevance...`);
-      const queryWords = message.toLowerCase().split(/\s+/).filter(word => word.length > 3);
-      const scoredChunks = chunkRows.map(row => {
-        const content = row.content.toLowerCase();
-        const matches = queryWords.filter(word => content.includes(word)).length;
-        return {
-          content: row.content,
-          score: matches
-        };
-      });
-      
-      const topChunks = scoredChunks
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 15);
-        
-      relevantContext = topChunks.map(c => c.content).join("\n\n---\n\n");
-      console.log(`🔑 Keyword search: Retrieved ${topChunks.length} chunks with ${queryWords.length} keywords`);
-    } else {
-      sendStatus("No chunks found, using full text fallback...");
-      const [fullRows] = await pool.execute("SELECT content FROM journals WHERE id = ?", [journalId]);
-      relevantContext = fullRows[0].content.substring(0, 20000); // Increased from 15000
-    }
+      .map(row => row.content.substring(10));
 
     const history = historyRows.map(row => {
-          if (row.role === 'user') return new HumanMessage(row.content);
-          if (row.role === 'assistant') return new AIMessage(row.content);
-          if (row.role === 'system') return new SystemMessage(row.content); // <-- ADD THIS LINE
-          return new HumanMessage(row.content); // Safe fallback
-        }); 
+      if (row.role === 'user') return new HumanMessage(row.content);
+      if (row.role === 'assistant') return new AIMessage(row.content);
+      if (row.role === 'system') return new SystemMessage(row.content);
+      return new HumanMessage(row.content);
+    });
 
-    // Build system prompt with corrected answers if available
-    let systemPrompt = `You are discussing the document: "${journalFilename}".
-    You are a helpful assistant answering questions about journal articles.
+    // Invoke LangGraph
+    const result = await appGraph.invoke({
+      messages: [new HumanMessage(message)],
+      journalId,
+      journalFilename,
+      history,
+      correctedAnswers,
+      sendStatus
+    });
 
-    IMPORTANT: Below are RELEVANT SNIPPETS from "${journalFilename}" found via semantic search.
-    Use these snippets to answer the user's question. If the answer isn't in the snippets, please say "Based on the available context from the document, I cannot find a specific answer to this question."`;
-
-    // Add corrected answers to the system prompt if they exist
-    if (correctedAnswers.length > 0) {
-      systemPrompt += `\n\nIMPORTANT: The following corrections have been made in previous conversations and should be used as authoritative information:
-      ${correctedAnswers.map((answer, index) => `${index + 1}. ${answer}`).join('\n')}`;
-    }
-
-    systemPrompt += `
-    
-    --- RELEVANT CONTEXT START ---
-    ${relevantContext}
-    --- RELEVANT CONTEXT END ---
-    
-    Answer the user's question based on the above context. If you cannot find the answer in the context, please acknowledge this limitation rather than providing incorrect information.
-    
-    IMPORTANT: If the context contains information about the question but in a different format (e.g., tables, figures, measurements), try to extract and present that information clearly.`;
-
-    // v1 API has issues with the 'systemInstruction' field in some SDK versions.
-    // Instead of SystemMessage, we prepend the context to the HumanMessage.
-    const contextualMessage = `${systemPrompt}\n\nUser Question: ${message}`;
-    const allMessages = [...history, new HumanMessage(contextualMessage)];
-
-    sendStatus("Generating response with Cerebras Llama 3.3...");
-    const result = await appGraph.invoke({ messages: allMessages });
+    // The final message is the output from generating node
     const botResponse = result.messages[result.messages.length - 1];
 
     // SAVE NEW MESSAGES TO MYSQL
